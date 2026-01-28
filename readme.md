@@ -1,10 +1,10 @@
 Streaming Archive
 -----------------
-This utility is designed to backup multiple streaming inputs vi fifo named pipes.  Stdin is also allowed as an input.  As the name implies, the input is groupped together into a single output stream, which can be stored on disk or tape.  If the output is stored on a random access device, then the archive contents can be viewed without reading the entire file, but obviously, if the archive is stored on tape, then you would need to read the entire archive in order to view the contents.   
+This utility is designed to backup multiple streaming inputs via fifo named pipes.  Stdin is also allowed as an input.  As the name archive implies, the input is groupped together into a single output stream, which can be stored on disk or tape.  If the output is stored on a random access device, then the archive contents can be viewed without reading the entire file, but obviously, if the archive is stored on tape, then you would need to read the entire archive in order to view the contents.   
 
-Currently, the input streams are read sequentially and stored sequentially in the output archive.  AKA, all of the input will block, except the stream that is being read.  When that stream hits EOF, then the next stream is opened and read in turn.
+Currently, the input streams are read sequentially and stored sequentially in the output archive.  AKA, all of the input streams will block, except the stream that is being read.  When that stream hits EOF, then the next stream is opened and read in turn.  Future development is planned to read the streams in parallel and store the streams in the output archive as a heterogeneous mixture, or interleaving blocks.
 
-Input streams can be listed on the command line or read from an input file.  Since streams, especially stdin, may not have a valid filename, each stream should specifiy what the stream should be called in the archive.
+Input streams can be listed on the command line or read from an input file.  Since streams, especially stdin, may not have a pretty filename, each stream should specifiy what the name of the stream should be called in the archive, along with the full path to the stream, or "-" for stdin.
 
 ## Usage
 
@@ -36,7 +36,7 @@ Input streams can be listed on the command line or read from an input file.  Sin
       Extract:  sarc -a backup.bin -x [item ...]
       List:     sarc -a backup.bin -l
 
-## Exampe Listing
+## Exampe content listing
 
 
     $ sarc -la fili.20260128.sarc
