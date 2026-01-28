@@ -7,10 +7,12 @@ import argparse
 import stat
 import time
 import signal
+import struct
 from datetime import datetime
 
-VERSION = "1.25"
+VERSION = "1.27"
 DELIM = 'þ'
+BLOCK_SIZE = 65536
 
 def parse_size(size_str):
     suffixes = {'b': 1, 'k': 1024, 'm': 1024**2, 'g': 1024**3, 't': 1024**4, 'p': 1024**5}
@@ -39,190 +41,210 @@ def format_size(size, fixed_width=False, raw_bytes=False):
         return f"{val:>8} PiB"
     return f"{val} PiB"
 
-def get_index(f):
-    f.seek(-19, os.SEEK_END)
-    footer = f.read(19)
-    index_size = int.from_bytes(footer[:8], 'little')
-    magic = footer[8:].decode()
-    if magic != "MYARCHIVEV1":
-        print("ERROR: Invalid archive format.", file=sys.stderr)
-        sys.exit(2)
-    f.seek(-(19 + index_size), os.SEEK_END)
-    return f.read(index_size).decode().strip().split('\n')
+def is_sequential(f, force_tape=False):
+    if force_tape:
+        return True
+    try:
+        mode = os.fstat(f.fileno()).st_mode
+        if stat.S_ISCHR(mode) or stat.S_ISFIFO(mode):
+            return True
+    except (OSError, AttributeError):
+        pass
+    return False
 
-def list_contents(archive_path, raw_bytes=False):
+def get_index(f):
+    try:
+        f.seek(-19, os.SEEK_END)
+        footer = f.read(19)
+        index_size = int.from_bytes(footer[:8], 'little')
+        magic = footer[8:].decode()
+        if magic != "MYARCHIVEV1":
+            return None
+        f.seek(-(19 + index_size), os.SEEK_END)
+        return f.read(index_size).decode().strip().split('\n')
+    except OSError:
+        return None
+
+def list_contents(archive_path, raw_bytes=False, force_tape=False):
     if not os.path.exists(archive_path):
         print(f"ERROR: Archive {archive_path} not found.", file=sys.stderr)
         sys.exit(2)
     with open(archive_path, 'rb') as f:
         index_lines = get_index(f)
+        if not index_lines:
+            print("ERROR: Could not read index. Use extraction to recover sequential data.", file=sys.stderr)
+            sys.exit(2)
+        
         name_width = 20
         for line in index_lines:
             name_width = max(name_width, len(line.split(DELIM)[0]) + 2)
         
-        if raw_bytes:
-            # Numeric field is 12. "Size" (4) right-aligned in 12 + 2 spaces padding
-            size_header = f"{'Size':>12}     "
-        else:
-            # Numeric field is 8. "Size" (4) right-aligned in 8 + 5 spaces padding
-            size_header = f"{'Size':>8}     "
-            
+        size_header = f"{'Size':>{12 if raw_bytes else 8}}     "
         header = f"{'Name':<{name_width}} {size_header} {'Timestamp':<20} {'SHA256 Checksum'}"
-        checksum_len = 64
-        total_width = name_width + 1 + len(size_header) + 1 + 20 + 1 + checksum_len
         print(header)
-        print("-" * total_width)
+        print("-" * (name_width + len(size_header) + 87))
         for line in index_lines:
             name, offset, size, sha256, mtime = line.split(DELIM)
             display_size = format_size(int(size), fixed_width=True, raw_bytes=raw_bytes)
             print(f"{name:<{name_width}} {display_size}  {mtime:<20} {sha256}")
 
-def extract_contents(archive_path, targets=None, quiet=False, verbose=False, raw_bytes=False):
-    if not os.path.exists(archive_path):
-        print(f"ERROR: Archive {archive_path} not found.", file=sys.stderr)
-        sys.exit(2)
-
+def extract_contents(archive_path, targets=None, quiet=False, verbose=False, raw_bytes=False, force_tape=False):
     current_extracting_file = None
 
     def signal_handler(sig, frame):
         if current_extracting_file and os.path.exists(current_extracting_file):
             os.remove(current_extracting_file)
-            sys.stderr.write(f"\nCleaning up: {current_extracting_file} deleted.\n")
-        sys.stderr.write("user cancelled\n")
         sys.exit(2)
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    with open(archive_path, 'rb') as f:
-        index_lines = get_index(f)
+    f = sys.stdin.buffer if archive_path == "-" else open(archive_path, 'rb')
+    try:
+        seq_mode = is_sequential(f, force_tape)
+        index_lines = None if seq_mode else get_index(f)
         
-        filtered_items = []
-        est_total_size = 0
-        for line in index_lines:
-            name, offset, size, sha256, mtime = line.split(DELIM)
-            if targets and name not in targets:
-                continue
-            filtered_items.append((name, int(offset), int(size), sha256))
-            est_total_size += int(size)
+        if not seq_mode and index_lines:
+            filtered = [l.split(DELIM) for l in index_lines if not targets or l.split(DELIM)[0] in targets]
+            est_total = sum(int(l[2]) for l in filtered)
+            total_written = 0
+            start_time = time.time()
+            last_upd = 0
 
-        total_written = 0
-        start_time = time.time()
-        last_update_time = 0
+            for name, offset, size, sha256, mtime in filtered:
+                current_extracting_file = name
+                if verbose: sys.stderr.write(f"\r\033[KExtracting: {name}\n")
+                f.seek(int(offset))
+                f.read(len(name.encode()) + 1)
+                
+                sha256_hash = hashlib.sha256()
+                with open(name, 'wb') as f_out:
+                    while True:
+                        size_data = f.read(4)
+                        if not size_data: break
+                        blen = struct.unpack('<I', size_data)[0]
+                        if blen == 0: break
+                        chunk = f.read(blen)
+                        f_out.write(chunk)
+                        sha256_hash.update(chunk)
+                        total_written += blen
 
-        for name, offset, size, sha256 in filtered_items:
-            current_extracting_file = name
-            if verbose:
-                sys.stderr.write(f"\r\033[KExtracting: {name}\n")
-            
-            f.seek(offset)
-            remaining = size
-            sha256_hash = hashlib.sha256()
-            
-            with open(name, 'wb') as f_out:
-                while remaining > 0:
-                    chunk = f.read(min(remaining, 65536))
-                    if not chunk: break
-                    f_out.write(chunk)
-                    sha256_hash.update(chunk)
-                    chunk_len = len(chunk)
-                    remaining -= chunk_len
-                    total_written += chunk_len
-
-                    if not quiet:
-                        now = time.time()
-                        if now - last_update_time >= 0.25:
-                            elapsed = now - start_time
+                        if not quiet and time.time() - last_upd >= 0.25:
+                            elapsed = time.time() - start_time
                             speed = total_written / elapsed if elapsed > 0 else 0
-                            processed_str = format_size(total_written, fixed_width=True, raw_bytes=raw_bytes)
+                            proc_str = format_size(total_written, fixed_width=True, raw_bytes=raw_bytes)
                             speed_str = format_size(speed, raw_bytes=raw_bytes)
-                            out = f" {processed_str} [{speed_str}/s]"
-                            if est_total_size > 0:
-                                percent = (total_written / est_total_size) * 100
-                                eta = (est_total_size - total_written) / speed if speed > 0 else 0
+                            out = f" {proc_str} [{speed_str}/s]"
+                            if est_total > 0:
+                                percent = (total_written / est_total) * 100
+                                eta = (est_total - total_written) / speed if speed > 0 else 0
                                 out += f" {percent:6.1f}% ETA: {int(eta//3600):02}:{int((eta%3600)//60):02}:{int(eta%60):02}"
                             sys.stderr.write(f"\r{out}\033[K\r")
                             sys.stderr.flush()
-                            last_update_time = now
-            
-            if sha256_hash.hexdigest() != sha256:
-                sys.stderr.write(f"\nWARNING: Checksum mismatch for {name}!\n")
-            current_extracting_file = None
+                            last_upd = time.time()
 
-        if not quiet: sys.stderr.write("\n")
+                if sha256_hash.hexdigest() != sha256:
+                    sys.stderr.write(f"\nWARNING: Checksum mismatch for {name}!\n")
+                current_extracting_file = None
+        else:
+            start_time = time.time()
+            total_written = 0
+            last_upd = 0
+            while True:
+                name_buf = bytearray()
+                while True:
+                    b = f.read(1)
+                    if not b or b == b'\x00': break
+                    name_buf.append(b[0])
+                if not name_buf: break 
+                
+                name = name_buf.decode()
+                do_extract = not targets or name in targets
+                current_extracting_file = name if do_extract else None
+                
+                if verbose and do_extract: sys.stderr.write(f"\r\033[KExtracting: {name}\n")
+                
+                sha256_hash = hashlib.sha256()
+                f_out = open(name, 'wb') if do_extract else None
+                
+                while True:
+                    size_data = f.read(4)
+                    if not size_data: break
+                    blen = struct.unpack('<I', size_data)[0]
+                    if blen == 0: break
+                    chunk = f.read(blen)
+                    if f_out:
+                        f_out.write(chunk)
+                        sha256_hash.update(chunk)
+                    total_written += blen
+                    
+                    if not quiet and time.time() - last_upd >= 0.25:
+                        elapsed = time.time() - start_time
+                        speed = total_written / elapsed if elapsed > 0 else 0
+                        proc_str = format_size(total_written, fixed_width=True, raw_bytes=raw_bytes)
+                        sys.stderr.write(f"\r {proc_str} [{format_size(speed, raw_bytes=raw_bytes)}/s] (Streaming...)\033[K")
+                        last_upd = time.time()
+
+                if f_out: f_out.close()
+                current_extracting_file = None
+    finally:
+        if archive_path != "-": f.close()
+    if not quiet: sys.stderr.write("\n")
 
 def archive(output_file, manifest, quiet=False, verbose=False, est_total_size=0, raw_bytes=False):
-    if output_file in [None, "-"]:
-        f_out = sys.stdout.buffer
-        is_real_file = False
-    else:
-        f_out = open(output_file, 'wb')
-        is_real_file = True
-
+    f_out = sys.stdout.buffer if output_file == "-" else open(output_file, 'wb')
     try:
         index = []
-        current_pos = 0
-        total_written = 0
+        current_pos, total_written = 0, 0
         start_time = time.time()
-        last_update_time = 0
+        last_upd = 0
 
         for target_name, source_path in manifest:
-            if verbose:
-                sys.stderr.write(f"\r\033[KProcessing: {target_name}\n")
-
-            if source_path == "-":
-                f_in = sys.stdin.buffer
-                mtime_raw = datetime.now().timestamp()
-            else:
-                st = os.stat(source_path)
-                mtime_raw = datetime.now().timestamp() if stat.S_ISFIFO(st.st_mode) else st.st_mtime
-                f_in = open(source_path, 'rb', buffering=0)
-
+            if verbose: sys.stderr.write(f"\r\033[KProcessing: {target_name}\n")
+            f_in = sys.stdin.buffer if source_path == "-" else open(source_path, 'rb', buffering=0)
+            
+            st = os.stat(source_path) if source_path != "-" else None
+            mtime_raw = st.st_mtime if st and not stat.S_ISFIFO(st.st_mode) else datetime.now().timestamp()
             mtime_str = datetime.fromtimestamp(mtime_raw).strftime('%Y-%m-%d %H:%M:%S')
-            sha256_hash = hashlib.sha256()
-            start_offset = current_pos
-            size = 0
-            
-            try:
-                while True:
-                    chunk = f_in.read(65536)
-                    if not chunk: break
-                    f_out.write(chunk)
-                    sha256_hash.update(chunk)
-                    chunk_len = len(chunk)
-                    size += chunk_len
-                    current_pos += chunk_len
-                    total_written += chunk_len
 
-                    if not quiet:
-                        now = time.time()
-                        if now - last_update_time >= 0.25:
-                            elapsed = now - start_time
-                            speed = total_written / elapsed if elapsed > 0 else 0
-                            processed_str = format_size(total_written, fixed_width=True, raw_bytes=raw_bytes)
-                            speed_str = format_size(speed, raw_bytes=raw_bytes)
-                            out = f" {processed_str} [{speed_str}/s]"
-                            if est_total_size > 0:
-                                percent = (total_written / est_total_size) * 100
-                                eta = (est_total_size - total_written) / speed if speed > 0 else 0
-                                out += f" {percent:6.1f}% ETA: {int(eta//3600):02}:{int((eta%3600)//60):02}:{int(eta%60):02}"
-                            sys.stderr.write(f"\r{out}\033[K\r")
-                            sys.stderr.flush()
-                            last_update_time = now
-            finally:
-                if source_path != "-":
-                    f_in.close()
+            header = target_name.encode() + b'\x00'
+            f_out.write(header)
+            start_offset = current_pos
+            current_pos += len(header)
+            sha256_hash, file_size = hashlib.sha256(), 0
+
+            while True:
+                chunk = f_in.read(BLOCK_SIZE)
+                if not chunk: break
+                f_out.write(struct.pack('<I', len(chunk)) + chunk)
+                sha256_hash.update(chunk)
+                file_size += len(chunk)
+                current_pos += (4 + len(chunk))
+                total_written += len(chunk)
+
+                if not quiet and time.time() - last_upd >= 0.25:
+                    elapsed = time.time() - start_time
+                    speed = total_written / elapsed if elapsed > 0 else 0
+                    proc_str = format_size(total_written, fixed_width=True, raw_bytes=raw_bytes)
+                    speed_str = format_size(speed, raw_bytes=raw_bytes)
+                    out = f" {proc_str} [{speed_str}/s]"
+                    if est_total_size > 0:
+                        percent = (total_written / est_total_size) * 100
+                        eta = (est_total_size - total_written) / speed if speed > 0 else 0
+                        out += f" {percent:6.1f}% ETA: {int(eta//3600):02}:{int((eta%3600)//60):02}:{int(eta%60):02}"
+                    sys.stderr.write(f"\r{out}\033[K\r")
+                    sys.stderr.flush()
+                    last_upd = time.time()
             
-            index.append(f"{target_name}{DELIM}{start_offset}{DELIM}{size}{DELIM}{sha256_hash.hexdigest()}{DELIM}{mtime_str}")
+            f_out.write(struct.pack('<I', 0))
+            current_pos += 4
+            if source_path != "-": f_in.close()
+            index.append(f"{target_name}{DELIM}{start_offset}{DELIM}{file_size}{DELIM}{sha256_hash.hexdigest()}{DELIM}{mtime_str}")
 
         if not quiet: sys.stderr.write("\n")
         index_data = "\n".join(index).encode()
-        f_out.write(index_data)
-        f_out.write(len(index_data).to_bytes(8, 'little'))
-        f_out.write(b"MYARCHIVEV1")
-        f_out.flush()
+        f_out.write(index_data + len(index_data).to_bytes(8, 'little') + b"MYARCHIVEV1")
     finally:
-        if is_real_file:
-            f_out.close()
+        if output_file != "-": f_out.close()
 
 if __name__ == "__main__":
     class CustomFormatter(argparse.RawDescriptionHelpFormatter):
@@ -230,7 +252,7 @@ if __name__ == "__main__":
             super().__init__(prog, max_help_position=24)
 
     parser = argparse.ArgumentParser(
-        description=f"Streaming Archiver (sarc); version {VERSION}",
+        description=f"Streaming Archiver (sarc) v{VERSION}",
         formatter_class=CustomFormatter,
         epilog="Examples:\n  Archive:  sarc -a backup.bin root.img::/dev/zvol/root\n  Extract:  sarc -a backup.bin -x [item ...]\n  List:     sarc -a backup.bin -l"
     )
@@ -238,6 +260,7 @@ if __name__ == "__main__":
     parser.add_argument("-a", "--archive", metavar="FILE", help="Archive filename (default: stdout '-')", default="-")
     parser.add_argument("-l", "--list", action="store_true", help="List contents of archive")
     parser.add_argument("-x", "--extract", action="store_true", help="Extract all or specific items")
+    parser.add_argument("-t", "--tape", action="store_true", help="Force sequential/tape mode")
     parser.add_argument("-f", "--file", metavar="FILE", help="Read manifest from file")
     parser.add_argument("-d", "--direct", action="store_true", help="Direct mode: use path as name")
     parser.add_argument("-q", "--quiet", action="store_true", help="Quiet mode (suppress progress)")
@@ -253,14 +276,11 @@ if __name__ == "__main__":
         if args.archive == "-":
             print("ERROR: Cannot list contents of stdout/pipe.", file=sys.stderr)
             sys.exit(2)
-        list_contents(args.archive, raw_bytes=args.bytes)
+        list_contents(args.archive, args.bytes, args.tape)
         sys.exit(0)
 
     if args.extract:
-        if args.archive == "-":
-            print("ERROR: Cannot extract from stdout/pipe.", file=sys.stderr)
-            sys.exit(2)
-        extract_contents(args.archive, args.manifest if args.manifest else None, quiet=args.quiet, verbose=args.verbose, raw_bytes=args.bytes)
+        extract_contents(args.archive, args.manifest or None, args.quiet, args.verbose, args.bytes, args.tape)
         sys.exit(0)
 
     manifest_items = []
