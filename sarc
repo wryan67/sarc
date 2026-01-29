@@ -273,6 +273,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if len(sys.argv) == 2 and args.verbose:
+        print(f"sarc {VERSION}")
+        sys.exit(0)
+
     modes = [args.create, args.toc, args.extract]
     if modes.count(True) != 1:
         print("ERROR: You must specify exactly one of -c, -t, or -x or -h for help.", file=sys.stderr)
