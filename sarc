@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/bin/python3
 
 import sys
 import os
@@ -188,7 +188,7 @@ def extract_contents(archive_path, targets=None, quiet=False, verbose=False, raw
                 current_extracting_file = None
     finally:
         if archive_path != "-": f.close()
-    if not quiet: sys.stderr.write("\n")
+        if not quiet: sys.stderr.write("\n")
 
 def archive(output_file, manifest, quiet=False, verbose=False, est_total_size=0, raw_bytes=False):
     f_out = sys.stdout.buffer if output_file == "-" else open(output_file, 'wb')
@@ -254,41 +254,47 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=f"Streaming Archiver (sarc) v{VERSION}",
         formatter_class=CustomFormatter,
-        epilog="Examples:\n  Archive:  sarc -a backup.bin root.img::/dev/zvol/root\n  Extract:  sarc -a backup.bin -x [item ...]\n  List:     sarc -a backup.bin -l"
+        epilog="Examples:\n  Archive:  sarc -c -f backup.bin root.img::/dev/zvol/root\n  Extract:  sarc -x -f backup.bin [item ...]\n  List:     sarc -t -f backup.bin"
     )
 
-    parser.add_argument("-a", "--archive", metavar="FILE", help="Archive filename (default: stdout '-')", default="-")
-    parser.add_argument("-l", "--list", action="store_true", help="List contents of archive")
+    parser.add_argument("-f", "--file",    metavar="FILE", help="Archive filename (default: stdout '-')", default="-")
+    parser.add_argument("-c", "--create",  action="store_true", help="Create a new archive")
+    parser.add_argument("-t", "--toc",     action="store_true", help="Table of contents (list items)")
     parser.add_argument("-x", "--extract", action="store_true", help="Extract all or specific items")
-    parser.add_argument("-t", "--tape", action="store_true", help="Force sequential/tape mode")
-    parser.add_argument("-f", "--file", metavar="FILE", help="Read manifest from file")
-    parser.add_argument("-d", "--direct", action="store_true", help="Direct mode: use path as name")
-    parser.add_argument("-q", "--quiet", action="store_true", help="Quiet mode (suppress progress)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose (show filenames)")
-    parser.add_argument("-b", "--bytes", action="store_true", help="Show sizes in bytes (default: human-readable)")
-    parser.add_argument("-s", "--size", metavar="SIZE", help="Estimated total size (e.g. 10g, 500m)")
+    parser.add_argument("-p", "--physical",action="store_true", help="Force physical tape device mode")
+    parser.add_argument("-T", "--files-from", metavar="FILE", help="Read manifest from file")
+    parser.add_argument("-d", "--direct",  action="store_true", help="Direct mode: use path as name")
+    parser.add_argument("-q", "--quiet",   action="store_true", help="Quiet mode (suppress progress)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="List files being processed")
+    parser.add_argument("-b", "--bytes",   action="store_true", help="Show sizes in bytes")
+    parser.add_argument("-s", "--size",    metavar="SIZE", help="Estimated total size")
     parser.add_argument("-V", "--version", action="version", version=f"sarc {VERSION}")
     parser.add_argument("manifest", nargs="*", help="Manifest [name::path] or extraction targets")
 
     args = parser.parse_args()
 
-    if args.list:
-        if args.archive == "-":
+    modes = [args.create, args.toc, args.extract]
+    if modes.count(True) != 1:
+        print("ERROR: You must specify exactly one of -c, -t, or -x or -h for help.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.toc:
+        if args.file == "-":
             print("ERROR: Cannot list contents of stdout/pipe.", file=sys.stderr)
             sys.exit(2)
-        list_contents(args.archive, args.bytes, args.tape)
+        list_contents(args.file, args.bytes, args.physical)
         sys.exit(0)
 
     if args.extract:
-        extract_contents(args.archive, args.manifest or None, args.quiet, args.verbose, args.bytes, args.tape)
+        extract_contents(args.file, args.manifest or None, args.quiet, args.verbose, args.bytes, args.physical)
         sys.exit(0)
 
     manifest_items = []
     stdin_count = 0
     raw_items = list(args.manifest)
 
-    if args.file:
-        with open(args.file, 'r') as f:
+    if args.files_from:
+        with open(args.files_from, 'r') as f:
             raw_items.extend([line.strip() for line in f if line.strip()])
 
     for item in raw_items:
@@ -306,17 +312,17 @@ if __name__ == "__main__":
     if stdin_count > 1:
         print("ERROR: Only one manifest item can use stdin ('-').", file=sys.stderr)
         sys.exit(2)
-    if args.archive == "-" and stdin_count > 0:
+    if args.file == "-" and stdin_count > 0:
         print("ERROR: Cannot use stdin for input AND stdout for output simultaneously.", file=sys.stderr)
         sys.exit(2)
 
     est_size_bytes = parse_size(args.size) if args.size else 0
 
     try:
-        archive(args.archive, manifest_items, quiet=args.quiet, verbose=args.verbose, est_total_size=est_size_bytes, raw_bytes=args.bytes)
+        archive(args.file, manifest_items, quiet=args.quiet, verbose=args.verbose, est_total_size=est_size_bytes, raw_bytes=args.bytes)
     except KeyboardInterrupt:
-        if args.archive != "-" and os.path.exists(args.archive):
-            os.remove(args.archive)
-            sys.stderr.write(f"\nCleaning up: {args.archive} deleted.\n")
+        if args.file != "-" and os.path.exists(args.file):
+            os.remove(args.file)
+            sys.stderr.write(f"\nCleaning up: {args.file} deleted.\n")
         sys.stderr.write("user cancelled\n")
         sys.exit(2)
